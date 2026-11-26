@@ -68,6 +68,10 @@
   .price{display:flex;align-items:baseline;gap:8px;margin-top:auto}
   .price s{color:var(--dim);font-size:13px}
   .price strong{font-size:18px;font-weight:800}
+  .rev{display:block;font-size:12px;color:var(--sub);margin-bottom:2px}
+  .price s,.price strong{white-space:nowrap}
+  .rev.good{color:var(--info)} .rev.bad{color:#e08a5a}
+  .more-wrap{text-align:center;margin:20px 0}
   .foot{font-size:12.5px;color:var(--sub);display:flex;justify-content:space-between;gap:6px;border-top:1px solid var(--line);
     padding-top:8px}
   .soon{color:var(--accent);font-weight:700}
@@ -133,7 +137,7 @@
       <option value="75">75% 이상</option><option value="90">90% 이상</option>
     </select>
     <select id="maxprice" data-only="sales">
-      <option value="">가격 전체</option><option value="5000">5천 원 이하</option>
+      <option value="">가격 전체</option><option value="3000">3천 원 이하</option><option value="5000">5천 원 이하</option>
       <option value="10000">1만 원 이하</option><option value="20000">2만 원 이하</option>
       <option value="30000">3만 원 이하</option>
     </select>
@@ -143,11 +147,12 @@
   </div>
   <div class="chips" id="chips">
     <span class="chip" data-f="korean" aria-pressed="false">한글 지원</span>
-    <span class="chip" data-f="korean_voice" aria-pressed="false">한국어 음성</span>
+    <span class="chip" data-f="korean_voice" data-only="upcoming calendar" aria-pressed="false">한국어 음성</span>
     <span class="chip" data-f="single" aria-pressed="false">싱글</span>
     <span class="chip" data-f="multi" aria-pressed="false">멀티</span>
     <span class="chip" data-f="coop" aria-pressed="false">협동</span>
-    <span class="chip" data-f="demo" aria-pressed="false">체험판 있음</span>
+    <span class="chip" data-f="demo" data-only="upcoming calendar" aria-pressed="false">체험판 있음</span>
+    <span class="chip" data-f="good" data-only="sales" aria-pressed="false">평가 80% 이상</span>
     <span class="chip" data-f="ending" data-only="sales" aria-pressed="false">3일 안에 할인 종료</span>
   </div>
   <div class="bar"><span id="count"></span><button class="btn" id="copy">목록 텍스트로 복사</button></div>
@@ -162,12 +167,13 @@
 <div class="toast" id="toast"></div>
 
 <script>
+const PAGE = 120;
 const S = { tab:"sales", data:{sales:[],upcoming:[]}, flags:new Set(), calMonth:null, selDay:null };
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const DOW = ["일","월","화","수","목","금","토"];
 const SORTS = {
-  sales: [["pop","인기순"],["pct","할인율 높은 순"],["cheap","가격 낮은 순"],["ending","할인 종료 임박 순"],["name","이름순"]],
+  sales: [["pop","인기순"],["pct","할인율 높은 순"],["review","평가 좋은 순"],["cheap","가격 낮은 순"],["ending","할인 종료 임박 순"],["name","이름순"]],
   upcoming: [["date","출시일 빠른 순"],["pop","인기순"],["name","이름순"]],
   calendar: [["pop","인기순"]],
 };
@@ -200,6 +206,7 @@ function saleEndInfo(ts){
   else left = `D-${Math.ceil(days)}`;
   return {txt:`${left} · ${fmtDate(iso)} ${hh}시 종료`, cls: days<3 ? "urgent" : days<7 ? "soon" : "", days};
 }
+function revScore(g){ const r=g.review; if(!r||r.pct==null) return -1; const c=r.count||0; return c<30 ? r.pct-40 : r.pct + Math.min(c,100000)/100000; }
 function modes(g){
   return [g.single&&"싱글", g.multi&&"멀티", g.coop&&"협동"].filter(Boolean).join(" · ");
 }
@@ -216,7 +223,7 @@ async function load(){
     const t = S.data.updated_at.replace("T"," ").slice(0,16);
     $("#updated").textContent = `마지막 갱신 ${t} (한국시간)`;
   } else $("#updated").textContent = "아직 첫 갱신 전이에요";
-  $("#n-sales").textContent = S.data.sales.length;
+  $("#n-sales").textContent = S.data.sales.length.toLocaleString();
   $("#n-upcoming").textContent = S.data.upcoming.length;
   const genres = new Map();
   [...S.data.sales, ...S.data.upcoming].forEach(g => (g.genres||[]).forEach(x => genres.set(x,(genres.get(x)||0)+1)));
@@ -238,7 +245,10 @@ function filtered(list){
     if(q && !(g.name||"").toLowerCase().includes(q)) return false;
     if(genre && !(g.genres||[]).includes(genre)) return false;
     for(const f of S.flags){
-      if(f==="ending"){ if(S.tab==="sales" && saleEndInfo(g.sale_end).days>3) return false; }
+      const only = document.querySelector(`.chip[data-f="${f}"]`)?.dataset.only;
+      if(only && !only.split(" ").includes(S.tab)) continue;
+      if(f==="ending"){ if(saleEndInfo(g.sale_end).days>3) return false; }
+      else if(f==="good"){ if(!g.review || (g.review.pct??0)<80 || (g.review.count||0)<30) return false; }
       else if(!g[f]) return false;
     }
     if(S.tab==="sales"){
@@ -252,6 +262,7 @@ function sorted(list){
   const k = $("#sort").value, a=[...list];
   const relKey = g => (g.release?.date || "9999") + ({day:0,month:1,quarter:2,year:3}[g.release?.precision] ?? 4);
   if(k==="pct") a.sort((x,y)=>(y.price?.pct||0)-(x.price?.pct||0) || x._rank-y._rank);
+  else if(k==="review") a.sort((x,y)=>revScore(y)-revScore(x) || x._rank-y._rank);
   else if(k==="cheap") a.sort((x,y)=>(x.price?.final||0)-(y.price?.final||0));
   else if(k==="ending") a.sort((x,y)=>(x.sale_end||9e12)-(y.sale_end||9e12));
   else if(k==="name") a.sort((x,y)=>(x.name||"").localeCompare(y.name||"","ko"));
@@ -264,12 +275,13 @@ function card(g, kind){
   const tags = [];
   if(g.korean) tags.push(`<span class="tag ko">${g.korean_voice?"한국어 음성":"한글"}</span>`);
   if(g.demo) tags.push(`<span class="tag demo">체험판</span>`);
-  (g.genres||[]).slice(0,4).forEach(x=>tags.push(`<span class="tag">${esc(x)}</span>`));
+  (g.tags||g.genres||[]).slice(0,4).forEach(x=>tags.push(`<span class="tag">${esc(x)}</span>`));
   const m = modes(g);
   let badge="", priceHtml="", foot="";
   if(kind==="sales"){
     badge = `<span class="pct">-${g.price?.pct||0}%</span>`;
-    priceHtml = `<div class="price"><s>${esc(g.price?.orig_text)}</s><strong>${esc(g.price?.final_text)}</strong></div>`;
+    const rv = g.review && g.review.label ? `<span class="rev ${(g.review.pct??0)>=80?"good":(g.review.pct??100)<40?"bad":""}">${esc(g.review.label)}${g.review.pct!=null?` ${g.review.pct}%`:""}</span>` : "";
+    priceHtml = `<div style="margin-top:auto">${rv}<div class="price"><s>${esc(g.price?.orig_text)}</s><strong>${esc(g.price?.final_text)}</strong></div></div>`;
     const e = saleEndInfo(g.sale_end);
     foot = `<div class="foot"><span class="${e.cls}">${e.txt}</span><span>${esc(m)}</span></div>`;
   } else {
@@ -287,14 +299,28 @@ function card(g, kind){
 
 function renderList(kind){
   const list = sorted(filtered(S.data[kind]));
-  $("#count").textContent = `${list.length}개 게임`;
+  $("#count").textContent = `${list.length.toLocaleString()}개 게임`;
   S.current = list;
   if(!S.data[kind].length){
     $("#view").innerHTML = `<div class="empty">아직 데이터가 없어요.<br>GitHub 저장소의 <b>Actions</b> 탭에서 <b>Run workflow</b>를 눌러 첫 갱신을 해 주세요.<br>(10분쯤 걸려요)</div>`;
     return;
   }
-  $("#view").innerHTML = list.length ? `<div class="grid">${list.map(g=>card(g,kind)).join("")}</div>`
-    : `<div class="empty">조건에 맞는 게임이 없어요. 필터를 줄여 보세요.</div>`;
+  if(!list.length){ $("#view").innerHTML = `<div class="empty">조건에 맞는 게임이 없어요. 필터를 줄여 보세요.</div>`; return; }
+  S.shown = 0;
+  $("#view").innerHTML = `<div class="grid" id="grid"></div><div class="more-wrap"><button class="btn" id="more">더 보기</button></div>`;
+  const more = ()=>{
+    const next = list.slice(S.shown, S.shown + PAGE);
+    $("#grid").insertAdjacentHTML("beforeend", next.map(g=>card(g,kind)).join(""));
+    S.shown += next.length;
+    const left = list.length - S.shown;
+    $("#more").textContent = `더 보기 (${left.toLocaleString()}개 남음)`;
+    $("#more").parentElement.style.display = left>0 ? "" : "none";
+  };
+  $("#more").onclick = more;
+  more();
+  S.io?.disconnect();
+  S.io = new IntersectionObserver(es=>{ if(es[0].isIntersecting && S.shown<list.length) more(); }, {rootMargin:"600px"});
+  S.io.observe($("#more"));
 }
 
 function renderCalendar(){
@@ -349,11 +375,12 @@ function setupSort(){
   if(SORTS[S.tab].some(([v])=>v===cur)) $("#sort").value = cur;
   else if(S.tab==="upcoming") $("#sort").value="date";
   $("#sort").style.display = S.tab==="calendar" ? "none" : "";
-  document.querySelectorAll("[data-only]").forEach(el=>el.style.display = el.dataset.only===S.tab ? "" : "none");
+  document.querySelectorAll("[data-only]").forEach(el=>el.style.display = el.dataset.only.split(" ").includes(S.tab) ? "" : "none");
 }
 
 function render(){
   document.querySelectorAll(".tab").forEach(t=>t.setAttribute("aria-selected", t.dataset.tab===S.tab));
+  S.io?.disconnect();
   if(S.tab==="calendar") renderCalendar(); else renderList(S.tab);
   history.replaceState(null,"","#"+S.tab);
 }
@@ -369,6 +396,7 @@ function copyText(){
     const parts=[g.name, (g.genres||[]).join("/")];
     if(S.tab==="sales"){
       parts.push(`-${g.price?.pct}% ${g.price?.final_text} (정가 ${g.price?.orig_text})`);
+      if(g.review?.label) parts.push(`${g.review.label}${g.review.pct!=null?" "+g.review.pct+"%":""}`);
       if(g.sale_end){ const k=new Date(g.sale_end*1000+9*3600e3).toISOString().slice(0,10); parts.push(fmtDate(k)+" 할인 종료"); }
     } else parts.push(relLabel(g.release));
     parts.push(g.korean ? (g.korean_voice?"한국어 음성":"한글 지원") : "한글 미지원");
