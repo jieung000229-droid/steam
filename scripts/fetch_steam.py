@@ -20,10 +20,12 @@ import urllib.parse
 import urllib.request
 
 # ───────────── 설정 ─────────────
-MAX_SALE = int(os.environ.get("MAX_SALE", 150))          # 할인 게임 최대 몇 개
+MAX_SALE = int(os.environ.get("MAX_SALE", 0))            # 할인 게임 최대 몇 개 (0 = 전부)
 MAX_UPCOMING = int(os.environ.get("MAX_UPCOMING", 150))  # 출시 예정 게임 최대 몇 개
 KEEP_RELEASED_DAYS = 31   # 출시된 뒤에도 달력에 며칠 동안 남겨 둘지
 REQUEST_GAP = 1.6         # 스팀 요청 사이 쉬는 시간(초). 줄이면 차단될 수 있어요.
+TIME_LIMIT_MIN = 38       # 한 번 실행에 최대 몇 분까지 쓸지 (GitHub 실행 제한 45분 안쪽)
+STORE_PAGE_CHECKS = 60    # 할인 종료일을 못 찾은 게임 중 인기 상위 몇 개만 상점 페이지로 확인
 # ────────────────────────────────
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -224,8 +226,8 @@ def find_key(obj, key):
 def sale_ends_from_storebrowse(appids):
     """스팀 상점 API(IStoreBrowseService/GetItems)에서 할인 종료 시각 + 정확한 출시 시각"""
     ends, releases = {}, {}
-    for i in range(0, len(appids), 40):
-        chunk = appids[i:i + 40]
+    for i in range(0, len(appids), 50):
+        chunk = appids[i:i + 50]
         payload = {
             "ids": [{"appid": a} for a in chunk],
             "context": {"language": "koreana", "country_code": "KR", "steam_realm": 1},
@@ -287,6 +289,131 @@ def ts_to_kst_date(ts):
     return dt.datetime.fromtimestamp(int(ts), KST).strftime("%Y-%m-%d")
 
 
+# ───────── 할인 게임 전체: 검색 결과 한 줄에서 바로 읽기 ─────────
+# 게임마다 따로 물어보면 수천 번 요청해야 해서, 검색 결과(한 번에 100개)에
+# 들어 있는 이름·가격·할인율·출시일·평가·태그를 그대로 읽어 옵니다.
+
+GENRE_TAGS_EN = {
+    "Action", "Adventure", "RPG", "Strategy", "Simulation", "Casual", "Indie", "Puzzle",
+    "Racing", "Sports", "Horror", "Survival", "Platformer", "Shooter", "FPS", "Roguelike",
+    "Roguelite", "Sandbox", "Open World", "Visual Novel", "Card Game", "Fighting", "Management",
+    "City Builder", "Farming Sim", "Rhythm", "Tower Defense", "Metroidvania", "Souls-like",
+    "Hack and Slash", "JRPG", "Turn-Based Strategy", "Deckbuilding", "Stealth", "Party Game",
+    "Point & Click", "Hidden Object", "MMORPG", "Battle Royale", "Tactical", "Life Sim",
+    "Dating Sim", "Survival Horror", "Base Building", "Colony Sim", "Automation", "Bullet Hell",
+    "Arcade", "Cozy", "Detective", "Mystery", "Racing", "Flight", "Space", "Zombies",
+}
+MODE_TAGS_EN = {
+    "single": {"Singleplayer"},
+    "multi": {"Multiplayer", "Online PvP", "PvP", "Massively Multiplayer"},
+    "coop": {"Co-op", "Online Co-Op", "Local Co-Op", "Local Multiplayer", "Co-op Campaign"},
+}
+
+
+def load_tag_names():
+    """태그 번호 → (한글 이름, 영어 이름)"""
+    ko = http_get("https://store.steampowered.com/tagdata/populartags/koreana") or []
+    en = http_get("https://store.steampowered.com/tagdata/populartags/english") or []
+    en_map = {t.get("tagid"): t.get("name") for t in en if isinstance(t, dict)}
+    out = {}
+    for t in ko if isinstance(ko, list) else []:
+        tid = t.get("tagid")
+        out[tid] = (t.get("name") or en_map.get(tid) or "", en_map.get(tid, ""))
+    for tid, name in en_map.items():
+        out.setdefault(tid, (name, name))
+    return out
+
+
+def parse_sale_rows(results_html, tags):
+    """검색 결과 HTML → 게임 정보 목록"""
+    rows = []
+    starts = [m.start() for m in re.finditer(r'<a\s[^>]*data-ds-appid="', results_html)]
+    for i, st in enumerate(starts):
+        chunk = results_html[st: starts[i + 1] if i + 1 < len(starts) else len(results_html)]
+        m = re.search(r'data-ds-appid="(\d+)"', chunk)
+        if not m:
+            continue  # 번들(여러 게임 묶음)은 건너뜀
+        appid = int(m.group(1))
+        name = re.search(r'<span class="title">(.*?)</span>', chunk, re.S)
+        pct = re.search(r'data-discount="(\d+)"', chunk) or re.search(r'discount_pct">\s*-?(\d+)%', chunk)
+        final_num = re.search(r'data-price-final="(\d+)"', chunk)
+        orig_txt = re.search(r'discount_original_price">(.*?)</div>', chunk, re.S)
+        final_txt = re.search(r'discount_final_price[^"]*">(.*?)</div>', chunk, re.S)
+        rel = re.search(r'search_released[^"]*">(.*?)</div>', chunk, re.S)
+        img = re.search(r'<img src="([^"]+)"', chunk)
+        rev = re.search(r'search_review_summary\s+(\w+)"\s+data-tooltip-html="([^"]+)"', chunk)
+        tagids = re.search(r'data-ds-tagids="\[([\d,]*)\]"', chunk)
+        if not (name and pct and int(pct.group(1)) > 0):
+            continue
+        clean = lambda x: html.unescape(re.sub(r"<[^>]+>", "", x or "")).strip()
+        o_text, f_text = clean(orig_txt.group(1) if orig_txt else ""), clean(final_txt.group(1) if final_txt else "")
+        digits = lambda t: int(re.sub(r"[^\d]", "", t) or 0)
+        final_v = int(final_num.group(1)) / 100 if final_num else digits(f_text)
+        rel_text = clean(rel.group(1) if rel else "")
+        rel_date, rel_prec = parse_release_text(rel_text)
+        tag_ids = [int(x) for x in (tagids.group(1).split(",") if tagids and tagids.group(1) else [])]
+        tag_ko = [tags[t][0] for t in tag_ids if t in tags]
+        tag_en = {tags[t][1] for t in tag_ids if t in tags}
+        review = None
+        if rev:
+            tip = html.unescape(rev.group(2))
+            label = re.sub(r"<[^>]+>", "", tip.split("<br>")[0]).strip()
+            pm = re.search(r"(\d+)\s*%", tip)
+            cm = re.search(r"([\d,]+)\s*개", tip) or re.search(r"([\d,]+)\s+user reviews", tip)
+            review = {"label": label, "pct": int(pm.group(1)) if pm else None,
+                      "count": int(cm.group(1).replace(",", "")) if cm else None}
+        img_url = img.group(1) if img else ""
+        img_url = re.sub(r"capsule_sm_120(_alt_assets_\d+)?", "header", img_url)
+        rows.append({
+            "id": appid,
+            "name": clean(name.group(1)),
+            "img": img_url,
+            "url": f"https://store.steampowered.com/app/{appid}/",
+            "genres": [tags[t][0] for t in tag_ids if t in tags and tags[t][1] in GENRE_TAGS_EN][:5],
+            "tags": tag_ko[:6],
+            "free": False,
+            "price": {"orig": digits(o_text) or final_v, "final": final_v, "pct": int(pct.group(1)),
+                      "orig_text": o_text, "final_text": f_text},
+            "sale_end": None,
+            "release": {"text": rel_text, "date": rel_date, "precision": rel_prec, "coming_soon": False},
+            "review": review,
+            "korean": False,
+            "single": bool(tag_en & MODE_TAGS_EN["single"]),
+            "multi": bool(tag_en & MODE_TAGS_EN["multi"]),
+            "coop": bool(tag_en & MODE_TAGS_EN["coop"]),
+        })
+    return rows
+
+
+def search_pages(extra_params, limit, on_page):
+    """검색 결과를 100개씩 끝까지 넘기며 on_page(html) 호출. 가져온 수를 돌려줌"""
+    start, total = 0, None
+    while True:
+        params = {"start": start, "count": 100, "infinite": 1, "cc": "kr", "l": "koreana",
+                  "category1": 998, "ndl": 1}
+        params.update(extra_params)
+        data = http_get("https://store.steampowered.com/search/results/?" + urllib.parse.urlencode(params))
+        if not data or not data.get("results_html"):
+            break
+        total = int(data.get("total_count", 0) or 0)
+        if not on_page(data["results_html"]):
+            break
+        start += 100
+        if start >= total or (limit and start >= limit) or time_up(0.45):
+            break
+        if (start // 100) % 10 == 0:
+            log(f"   {start}/{total}")
+    return total
+
+
+START = time.time()
+
+
+def time_up(fraction=1.0):
+    """정해 둔 시간(TIME_LIMIT_MIN)의 fraction 만큼 지났는지"""
+    return time.time() - START > TIME_LIMIT_MIN * 60 * fraction
+
+
 # ───────── 실행 ─────────
 
 def load_previous():
@@ -302,49 +429,78 @@ def main():
     prev = load_previous()
     log(f"▶ 시작 {now:%Y-%m-%d %H:%M} (한국시간)")
 
-    log("1. 할인 중인 게임 목록")
-    sale_ids = search_appids({"specials": 1}, MAX_SALE)
-    log(f"   {len(sale_ids)}개")
+    log("1. 할인 중인 게임 전체")
+    tags = load_tag_names()
+    log(f"   태그 이름 {len(tags)}개 불러옴")
+    sales, seen = [], set()
 
-    log("2. 출시 예정 게임 목록")
+    def add_rows(h):
+        new = [r for r in parse_sale_rows(h, tags) if r["id"] not in seen]
+        for r in new:
+            seen.add(r["id"])
+        sales.extend(new)
+        return bool(re.search(r'data-ds-appid="\d+"', h))
+
+    total = search_pages({"specials": 1}, MAX_SALE, add_rows)
+    log(f"   스팀 전체 {total}개 중 {len(sales)}개 읽음")
+
+    log("2. 한글 지원 할인 게임 표시")
+    ko_ids = set()
+    search_pages({"specials": 1, "supportedlang": "koreana"}, MAX_SALE,
+                 lambda h: ko_ids.update(int(x) for x in re.findall(r'data-ds-appid="(\d+)"', h)) or True)
+    for g in sales:
+        g["korean"] = g["id"] in ko_ids
+    log(f"   한글 지원 {sum(g['korean'] for g in sales)}개")
+
+    log("3. 출시 예정 게임 목록")
     up_ids = search_appids({"filter": "popularcomingsoon"}, MAX_UPCOMING)
     log(f"   {len(up_ids)}개")
 
-    if not sale_ids and not up_ids:
+    if not sales and not up_ids:
         log("✗ 스팀에서 목록을 못 가져왔어요. 기존 데이터를 그대로 둡니다.")
         sys.exit(1)
 
-    log("3. 게임별 상세 정보")
-    games = {}
-    all_ids = list(dict.fromkeys(sale_ids + up_ids))
-    for n, appid in enumerate(all_ids, 1):
+    log("4. 출시 예정 게임 상세 정보")
+    upcoming_map = {}
+    for n, appid in enumerate(up_ids, 1):
         d = app_details(appid)
         if d and d.get("type") in ("game", None):
-            games[appid] = build_game(appid, d)
+            upcoming_map[appid] = build_game(appid, d)
         if n % 25 == 0:
-            log(f"   {n}/{len(all_ids)}")
+            log(f"   {n}/{len(up_ids)}")
 
-    log("4. 할인 종료일 · 정확한 출시 시각")
-    ends, rel_ts = sale_ends_from_storebrowse(all_ids)
+    log("5. 할인 종료일 · 정확한 출시 시각")
+    # 출시 예정작 먼저, 그다음 할인 게임을 인기순으로 (시간이 모자라면 뒤쪽은 생략)
+    order = list(upcoming_map) + [g["id"] for g in sales]
+    ends, rel_ts = {}, {}
+    for i in range(0, len(order), 200):
+        if time_up(0.9):
+            log("   시간 제한이 가까워 남은 게임의 종료일 확인은 다음 회차로 넘깁니다")
+            break
+        e, r = sale_ends_from_storebrowse(order[i:i + 200])
+        ends.update(e)
+        rel_ts.update(r)
     for k, v in sale_ends_from_featured().items():
         ends.setdefault(k, v)
-    missing = [a for a in sale_ids if a in games and a not in ends
-               and (games[a]["price"] or {}).get("pct")]
-    log(f"   API로 {len(ends)}개 확인, 상점 페이지에서 {len(missing)}개 추가 확인")
+    missing = [g["id"] for g in sales if g["id"] not in ends][:STORE_PAGE_CHECKS]
     for appid in missing:
+        if time_up(0.97):
+            break
         e = sale_end_from_store_page(appid, now)
         if e:
             ends[appid] = e
-
-    for appid, g in games.items():
-        if appid in ends:
-            g["sale_end"] = ends[appid]
+    # 이번에 못 찾은 종료일은 지난번 값(아직 안 지났으면)으로 채우기
+    prev_ends = {g.get("id"): g.get("sale_end") for g in prev.get("sales", []) if g.get("sale_end")}
+    now_ts = int(now.timestamp())
+    for g in sales:
+        g["sale_end"] = ends.get(g["id"]) or (prev_ends.get(g["id"]) if (prev_ends.get(g["id"]) or 0) > now_ts else None)
+    for appid, g in upcoming_map.items():
         if appid in rel_ts:  # 미국 시간 기준 날짜를 한국 날짜로 맞춤
             g["release"]["date"] = ts_to_kst_date(rel_ts[appid])
             g["release"]["precision"] = "day"
+    log(f"   할인 종료일 확인 {sum(1 for g in sales if g['sale_end'])}/{len(sales)}개")
 
-    sales = [games[a] for a in sale_ids if a in games and (games[a]["price"] or {}).get("pct")]
-    upcoming = [games[a] for a in up_ids if a in games]
+    upcoming = [upcoming_map[a] for a in up_ids if a in upcoming_map]
 
     # 이미 출시된 게임도 한 달 동안은 달력에 남겨 두기
     cutoff = (now - dt.timedelta(days=KEEP_RELEASED_DAYS)).strftime("%Y-%m-%d")
@@ -357,13 +513,15 @@ def main():
     out = {
         "updated_at": now.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
         "source": "스팀 상점 공개 정보 (비공식)",
+        "sale_total_on_steam": total,
         "sales": sales,
         "upcoming": upcoming,
     }
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-    log(f"✔ 저장 완료: 할인 {len(sales)}개, 출시 예정 {len(upcoming)}개")
+    log(f"✔ 저장 완료: 할인 {len(sales)}개, 출시 예정 {len(upcoming)}개 "
+        f"({(time.time() - START) / 60:.1f}분 걸림)")
 
 
 if __name__ == "__main__":
